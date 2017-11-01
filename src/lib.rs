@@ -6,15 +6,18 @@ use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_long;
 use std::ptr;
-use std::sync::mpsc::{Sender, Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Sender, Receiver, TryRecvError};
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
 use std::slice;
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-use std::io::Write;
 
+#[allow(non_camel_case_types)]
 pub type pthread_t = c_long;
+#[allow(non_camel_case_types)]
 pub type pthread_mutexattr_t = c_long;
+#[allow(non_camel_case_types)]
 pub type pthread_attr_t = c_void;       // FIXME: wrong
 
 extern {
@@ -39,6 +42,19 @@ pub unsafe extern fn cargo_apk_injected_glue_add_sender(sender: *mut ()) {
     let sender: Box<Sender<Event>> = Box::from_raw(sender as *mut _);
     add_sender(*sender);
 }
+
+#[no_mangle]
+pub unsafe extern fn cargo_apk_injected_glue_add_sync_event_handler(handler: *mut ()) {
+    let handler: Box<Box<SyncEventHandler>> = Box::from_raw(handler as *mut _);
+    add_sync_event_handler(*handler);
+}
+
+#[no_mangle]
+pub unsafe extern fn cargo_apk_injected_glue_remove_sync_event_handler(handler: *mut ()) {
+    let handler: Box<*const SyncEventHandler> = Box::from_raw(handler as *mut _);
+    remove_sync_event_handler(*handler);
+}
+
 
 #[no_mangle]
 pub unsafe extern fn cargo_apk_injected_glue_add_sender_missing(sender: *mut ()) {
@@ -78,7 +94,10 @@ pub static mut ANDROID_APP: *mut ffi::android_app = 0 as *mut ffi::android_app;
 /// This is the structure that serves as user data in the android_app*
 #[doc(hidden)]
 struct Context {
+    // Event listeners that receive async events using channels.
     senders:    Mutex<Vec<Sender<Event>>>,
+    // Event listeners that receive sync events from the polling loop.
+    sync_event_handlers:  Mutex<Vec<Box<SyncEventHandler>>>,
     // Any missed events are stored here.
     missed:     Mutex<Vec<Event>>,
     // Better performance to track number of missed items.
@@ -134,17 +153,22 @@ pub enum MotionAction {
     Cancel,
 }
 
+// Trait used to dispatch sync events from the polling loop thread.
+pub trait SyncEventHandler {
+    fn handle(&mut self, event: &Event);
+}
+
 #[cfg(not(target_os = "android"))]
 use this_platform_is_not_supported;
 
-static mut g_mainthread_boxed: Option<*mut Receiver<()>> = Option::None;
+static mut G_MAINTHREAD_BOXED: Option<*mut Receiver<()>> = Option::None;
 
 /// Return a tuple with tuple.0 set to true is the application thread
 /// has terminated, and tuple.1 set to true if an abnormal exit occured.
 fn is_app_thread_terminated() -> (bool, bool) {
-    if unsafe { g_mainthread_boxed.is_some() } {
+    if unsafe { G_MAINTHREAD_BOXED.is_some() } {
         // Let us see if it had shutdown or paniced.
-        let raw = unsafe { g_mainthread_boxed.unwrap() };
+        let raw = unsafe { G_MAINTHREAD_BOXED.unwrap() };
         let br: &mut Receiver<()> = unsafe { std::mem::transmute(raw) };
         let result = br.try_recv();
         let terminated = if result.is_err() {
@@ -155,7 +179,7 @@ fn is_app_thread_terminated() -> (bool, bool) {
         } else {
             (true, false)
         };
-        unsafe { g_mainthread_boxed = Option::Some(raw) };
+        unsafe { G_MAINTHREAD_BOXED = Option::Some(raw) };
         terminated
     } else {
         (true, false)
@@ -180,6 +204,7 @@ pub fn android_main2<F>(app: *mut ffi::android_app, main_function: F)
     // Creating the context that will be passed to the callback
     let context = Context {
         senders: Mutex::new(Vec::new()),
+        sync_event_handlers: Mutex::new(Vec::new()),
         missed: Mutex::new(Vec::new()),
         missedcnt: AtomicUsize::new(0),
         missedmax: 1024,
@@ -190,7 +215,7 @@ pub fn android_main2<F>(app: *mut ffi::android_app, main_function: F)
 
     app.onAppCmd = commands_callback;
     app.onInputEvent = inputs_callback;
-    app.userData = unsafe { &context as *const Context as *mut Context as *mut _ };
+    app.userData = &context as *const Context as *mut Context as *mut _;
 
     // We have to take into consideration that the application we are wrapping
     // may not have been designed for android very well. It may not listen for
@@ -242,8 +267,8 @@ pub fn android_main2<F>(app: *mut ffi::android_app, main_function: F)
 
                         buf.set_len(len);
 
-                        if let Some(last_newline_pos) = buf.iter().rposition(|&c| c == b'\n') {
-                            buf[last_newline_pos] = b'\0';
+                        if let Some(last_newline_pos) = buf.iter().rposition(|&c| c == b'\n' as c_char) {
+                            buf[last_newline_pos] = b'\0' as c_char;
                             ffi::__android_log_write(3, tag, buf.as_ptr());
                             if last_newline_pos < buf.len() - 1 {
                                 let last_newline_pos = last_newline_pos + 1;
@@ -252,7 +277,7 @@ pub fn android_main2<F>(app: *mut ffi::android_app, main_function: F)
                                 for j in 0..cursor as usize {
                                     buf[j] = buf[last_newline_pos + j];
                                 }
-                                buf[cursor] = b'\0';
+                                buf[cursor] = b'\0' as c_char;
                                 buf.set_len(cursor + 1);
                             } else {
                                 cursor = 0;
@@ -303,7 +328,7 @@ pub fn android_main2<F>(app: *mut ffi::android_app, main_function: F)
         // recalled after a Destroy event/command, then we can make check if the
         // main application thread we created above is still running, and if it is
         // we should wait on it to exit.
-        //unsafe { g_mainthread_boxed = Option::Some(std::mem::transmute(Box::new(mrx))) };
+        //unsafe { G_MAINTHREAD_BOXED = Option::Some(std::mem::transmute(Box::new(mrx))) };
 
     } else {
         write_log("Application thread was still running - not creating new one");
@@ -362,6 +387,16 @@ pub fn android_main2<F>(app: *mut ffi::android_app, main_function: F)
 /// is likely only one sender in our list, but we support more than one.
 fn send_event(event: Event) {
     let ctx = get_context();
+
+    // Notify sync event handlers
+    {
+        let mut sync_handlers = ctx.sync_event_handlers.lock().ok().unwrap();
+        for handler in sync_handlers.iter_mut() {
+            handler.handle(&event);
+        }
+    }
+
+    // Notify registered channel based event receivers
     let mut senders = ctx.senders.lock().ok().unwrap();
 
     // Store missed events up to a maximum.
@@ -494,6 +529,18 @@ pub fn add_sender(sender: Sender<Event>) {
     get_context().senders.lock().unwrap().push(sender);
 }
 
+/// Adds a SyncEventHandler which will process sync events from the polling loop.
+pub fn add_sync_event_handler(handler: Box<SyncEventHandler>) {
+    let mut handlers = get_context().sync_event_handlers.lock().unwrap();
+    handlers.push(handler);
+}
+
+/// Removes a SyncEventHandler.
+pub fn remove_sync_event_handler(handler: *const SyncEventHandler) {
+    let mut handlers = get_context().sync_event_handlers.lock().unwrap();
+    handlers.retain(|ref b| b.as_ref() as *const _ != handler);
+}
+
 pub fn set_multitouch(multitouch: bool) {
     get_context().multitouch.set(multitouch);
 }
@@ -533,7 +580,7 @@ pub unsafe fn get_native_window() -> ffi::NativeWindowType {
         }
 
         // spin-locking
-        thread::sleep_ms(10);
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
