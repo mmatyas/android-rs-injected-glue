@@ -1,6 +1,6 @@
 [package]
 name = "android_injected_glue"
-version = "0.2.2"
+version = "0.2.3"
 authors = ["Pierre Krieger <pierre.krieger1708@gmail.com>"]
 license = "MIT"
 description = "Injected glue for the Android JNI"
