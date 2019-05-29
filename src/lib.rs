@@ -159,7 +159,7 @@ pub trait SyncEventHandler {
 }
 
 #[cfg(not(target_os = "android"))]
-use this_platform_is_not_supported;
+extern crate this_platform_is_not_supported;
 
 static mut G_MAINTHREAD_BOXED: Option<*mut Receiver<()>> = Option::None;
 
